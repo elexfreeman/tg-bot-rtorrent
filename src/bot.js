@@ -5,8 +5,8 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import https from 'https';
-import { spawn } from 'child_process';
 import TelegramBot from 'node-telegram-bot-api';
+import { initLibtorrent, addTorrentFile, addMagnet, getStatus as ltGetStatus } from './libtorrent.js';
 
 // Environment configuration
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -15,18 +15,14 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// rTorrent integration options
-// 1) Preferred: use a watch directory where rTorrent picks up new .torrent files
-//    Set WATCH_DIR=/path/to/watch
-// 2) Fallback: use rtxmlrpc to add and query torrents via XML-RPC/SCGI
-//    Set RTORRENT_SCGI=127.0.0.1:5000 (host:port for scgi_port in .rtorrent.rc)
-//    Requires rtxmlrpc binary installed and in PATH.
-const WATCH_DIR = process.env.WATCH_DIR || '';
-const RTORRENT_SCGI = process.env.RTORRENT_SCGI || '127.0.0.1:5000';
+// libtorrent options
+// DOWNLOAD_DIR: folder where files will be saved by libtorrent
+const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'download');
 
 // Temp directory for storing incoming .torrent files before moving
 const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), 'tmp');
 await fsp.mkdir(TMP_DIR, { recursive: true });
+await fsp.mkdir(DOWNLOAD_DIR, { recursive: true });
 
 // Simple in-memory state to track which chats are awaiting inputs
 const awaitingTorrent = new Map(); // chatId -> true (awaiting .torrent document)
@@ -60,74 +56,8 @@ function downloadFileFromTelegram(filePath, destPath) {
   });
 }
 
-async function saveTorrentToWatchDir(tempFile, originalName) {
-  if (!WATCH_DIR) {
-    throw new Error('WATCH_DIR is not configured.');
-  }
-  await fsp.mkdir(WATCH_DIR, { recursive: true });
-  const target = path.join(WATCH_DIR, originalName || path.basename(tempFile));
-  await fsp.copyFile(tempFile, target);
-  return target;
-}
-
-function execRtxmlrpc(args, { timeoutMs = 8000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const cmd = 'rtxmlrpc';
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const to = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('rtxmlrpc timed out'));
-    }, timeoutMs);
-    child.stdout.on('data', (d) => (stdout += d.toString()));
-    child.stderr.on('data', (d) => (stderr += d.toString())) ;
-    child.on('error', reject);
-    child.on('close', (code) => {
-      clearTimeout(to);
-      if (code !== 0) return reject(new Error(stderr || `rtxmlrpc exited ${code}`));
-      resolve(stdout.trim());
-    });
-  });
-}
-
-async function addTorrentViaRtxmlrpc(filePath) {
-  // Attempt using load.start with local file path. Some setups may require load.raw_start.
-  // Try common methods in order.
-  const scgi = RTORRENT_SCGI;
-  const attempts = [
-    ['load.start', '', filePath],
-    ['load.raw_start', '', await fsp.readFile(filePath)],
-  ];
-  for (const attempt of attempts) {
-    try {
-      const [method, empty, payload] = attempt;
-      const args = ['-p', scgi, method];
-      if (payload instanceof Buffer) {
-        // rtxmlrpc expects hex for binary args; but many builds accept base64 or raw.
-        // Fallback to writing temp and using load.start.
-        continue;
-      } else {
-        args.push(empty, payload);
-      }
-      await execRtxmlrpc(args);
-      return true;
-    } catch (e) {
-      // try next
-    }
-  }
-  throw new Error('Failed to add torrent via rtxmlrpc. Ensure rtxmlrpc is installed and rTorrent exposes SCGI.');
-}
-
-async function addMagnetViaRtxmlrpc(magnetLink) {
-  if (!magnetLink || !magnetLink.toLowerCase().startsWith('magnet:?')) {
-    throw new Error('Неверная ссылка magnet.');
-  }
-  const scgi = RTORRENT_SCGI;
-  // load.start with empty tied directory and the magnet URI
-  await execRtxmlrpc(['-p', scgi, 'load.start', '', magnetLink]);
-  return true;
-}
+// Initialize libtorrent session
+await initLibtorrent({ downloadDir: DOWNLOAD_DIR });
 
 async function handleDownloadCommand(msg) {
   const chatId = msg.chat.id;
@@ -152,18 +82,10 @@ async function handleIncomingDocument(msg) {
     const tempPath = path.join(TMP_DIR, tempName);
     await downloadFileFromTelegram(file.file_path, tempPath);
 
-    let methodUsed = '';
-    if (WATCH_DIR) {
-      const target = await saveTorrentToWatchDir(tempPath, doc.file_name || tempName);
-      methodUsed = `Файл помещён в watch директорию: ${target}`;
-    } else {
-      // Try via rtxmlrpc
-      await addTorrentViaRtxmlrpc(tempPath);
-      methodUsed = 'Добавлено в rTorrent через rtxmlrpc.';
-    }
-
+    // Add via libtorrent
+    await addTorrentFile(tempPath, { savePath: DOWNLOAD_DIR });
     awaitingTorrent.delete(chatId);
-    await bot.sendMessage(chatId, `Торрент принят и добавлен. ${methodUsed}`);
+    await bot.sendMessage(chatId, `Торрент принят и добавлен в libtorrent.`);
   } catch (err) {
     console.error(err);
     await bot.sendMessage(chatId, `Не удалось добавить торрент: ${err.message}`);
@@ -187,70 +109,31 @@ async function handleIncomingText(msg) {
     return;
   }
   try {
-    await addMagnetViaRtxmlrpc(text);
+    await addMagnet(text, { savePath: DOWNLOAD_DIR });
     awaitingMagnet.delete(chatId);
-    await bot.sendMessage(chatId, 'Magnet ссылка добавлена в rTorrent.');
+    await bot.sendMessage(chatId, 'Magnet ссылка добавлена в libtorrent.');
   } catch (err) {
-    await bot.sendMessage(chatId, `Не удалось добавить magnet: ${err.message}\nУбедитесь, что доступен rtxmlrpc и настроен SCGI (RTORRENT_SCGI).`);
+    await bot.sendMessage(chatId, `Не удалось добавить magnet: ${err.message}`);
   }
-}
-
-async function getStatusViaRtxmlrpc() {
-  // Use d.multicall2 to fetch fields for all items in main view
-  const fields = [
-    'd.get_hash=',
-    'd.get_name=',
-    'd.get_state=', // 0 stopped, 1 started
-    'd.get_complete=', // 1 complete, 0 incomplete
-    'd.get_completed_bytes=',
-    'd.get_size_bytes=',
-    'd.get_down_rate=',
-    'd.get_up_rate=',
-  ];
-  const args = ['-p', RTORRENT_SCGI, 'd.multicall2', '', 'main', ...fields];
-  const out = await execRtxmlrpc(args, { timeoutMs: 5000 });
-
-  // rtxmlrpc output format can vary. Try to parse lines like:
-  // ( "hash" "name" 1 0 123 456 0 0 ) repeated per torrent
-  // We will extract quoted strings and numbers per line.
-  const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const items = [];
-  for (const line of lines) {
-    // Collect tokens: quoted strings or integers
-    const tokens = [];
-    const re = /"([^"]*)"|(-?\d+)/g;
-    let m;
-    while ((m = re.exec(line))) {
-      if (m[1] !== undefined) tokens.push(m[1]); else tokens.push(Number(m[2]));
-    }
-    if (tokens.length >= fields.length) {
-      const [hash, name, state, complete, doneBytes, sizeBytes, downRate, upRate] = tokens;
-      items.push({ hash, name, state, complete, doneBytes, sizeBytes, downRate, upRate });
-    }
-  }
-  return items;
 }
 
 async function handleStatusCommand(msg) {
   const chatId = msg.chat.id;
   try {
-    const items = await getStatusViaRtxmlrpc();
+    const items = ltGetStatus();
     if (!items.length) {
       await bot.sendMessage(chatId, 'Нет активных торрентов.');
       return;
     }
     const lines = items.slice(0, 15).map((t) => {
       const pct = t.sizeBytes > 0 ? Math.floor((t.doneBytes / t.sizeBytes) * 100) : 0;
-      const st = t.complete ? '✅' : (t.state ? '⬇️' : '⏸️');
+      const st = t.complete ? '✅' : (t.downRate > 0 ? '⬇️' : '⏸️');
       const dr = t.downRate ? `${Math.round(t.downRate / 1024)} KB/s` : '0 KB/s';
       return `${st} ${t.name}\n— ${pct}% • ${dr}`;
     });
     await bot.sendMessage(chatId, lines.join('\n\n'));
   } catch (err) {
-    const hint = WATCH_DIR
-      ? 'Статус требует rtxmlrpc и SCGI (RTORRENT_SCGI) для опроса.'
-      : 'Проверьте установку rtxmlrpc и SCGI (RTORRENT_SCGI).';
-    await bot.sendMessage(chatId, `Не удалось получить статус: ${err.message}\n${hint}`);
+    await bot.sendMessage(chatId, `Не удалось получить статус: ${err.message}`);
   }
 }
 
@@ -263,7 +146,7 @@ bot.setMyCommands([
 
 bot.onText(/^\/start/, async (msg) => {
   const text = [
-    'Привет! Я бот для загрузки торрентов через rTorrent.',
+    'Привет! Я бот для загрузки торрентов (node-libtorrent).',
     'Команды:',
     '/download — пришлите .torrent файл для добавления',
     '/status — показать статус текущих загрузок',
