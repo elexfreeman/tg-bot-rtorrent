@@ -1,33 +1,30 @@
-Telegram rTorrent Bot (Node.js)
+Telegram rqbit Bot (Node.js)
 
 Features
-- /download: asks for a .torrent file and adds it to rTorrent
-- /status: shows progress for current torrents (via rtxmlrpc)
-- /magnets_link: adds torrent via magnet link (requires rtxmlrpc)
+- /download: send a .torrent file — bot adds it to rqbit
+- /status: shows progress for current torrents via rqbit HTTP API
+- /magnets_link: adds torrent via magnet link
 
 Prerequisites
 - Node.js 18+
-- A running rTorrent instance
-  - Option A (recommended): rTorrent watch directory enabled (WATCH_DIR)
-  - Option B: rtxmlrpc installed and rTorrent SCGI enabled (RTORRENT_SCGI)
+- A running rqbit instance with HTTP API enabled (and reachable from the bot)
 
 Environment
 - BOT_TOKEN: Telegram bot token from @BotFather
-- WATCH_DIR: Path to rTorrent watch directory (optional, recommended)
-- RTORRENT_SCGI: Host:port to rTorrent SCGI (default: 127.0.0.1:5000)
+- RQBIT_API_BASE: Base URL of rqbit HTTP API (e.g. http://127.0.0.1:3030)
+- RQBIT_API_TOKEN: Optional bearer token for rqbit API (if configured)
 - TMP_DIR: Temp folder for incoming files (default: ./tmp)
 
 .env file
 - Copy `.env.example` to `.env` and fill values
   - cp .env.example .env
-  - Edit `.env` with your token and paths
+  - Edit `.env` with your token and rqbit API base URL
 
 Install
 1) npm install
 2) export BOT_TOKEN=xxxx
-3) Option A (watch dir): export WATCH_DIR=/path/to/watch
-   - Ensure rTorrent is configured to watch this directory
-4) Option B (rtxmlrpc): install rtxmlrpc and export RTORRENT_SCGI=127.0.0.1:5000
+3) export RQBIT_API_BASE=http://127.0.0.1:3030
+   - Ensure rqbit is running with HTTP API enabled and accessible
 
 Note: The app also loads environment variables from a local `.env` via `dotenv`.
 
@@ -35,7 +32,5 @@ Run
 - npm start
 
 Notes
-- /download uses WATCH_DIR if set; otherwise it attempts to add via rtxmlrpc.
-- /status requires rtxmlrpc + SCGI. If unavailable, a helpful error is shown.
 - The bot expects .torrent files sent as “document”, not as “photo” or “file compressed”.
-- /magnets_link requires rtxmlrpc + SCGI; watch directory cannot be used for magnets.
+- rqbit API paths vary by version. By default, the bot tries common endpoints like /api/v1/torrents. You can proxy or adjust rqbit to expose those, or adapt the code if needed.

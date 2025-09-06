@@ -2,14 +2,12 @@ import 'dotenv/config';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import os from 'os';
-import { fileURLToPath } from 'url';
 import https from 'https';
-import { spawn } from 'child_process';
 import TelegramBot from 'node-telegram-bot-api';
 
 // Environment configuration
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const TORRENT_DOWNLOAD_FOLDER = process.env.TORRENT_DOWNLOAD_FOLDER;
 if (!BOT_TOKEN) {
   console.error('BOT_TOKEN is not set. Export BOT_TOKEN and restart.');
   process.exit(1);
@@ -23,6 +21,9 @@ if (!BOT_TOKEN) {
 //    Requires rtxmlrpc binary installed and in PATH.
 const WATCH_DIR = process.env.WATCH_DIR || '';
 const RTORRENT_SCGI = process.env.RTORRENT_SCGI || '127.0.0.1:5000';
+// rqbit HTTP API configuration
+const RQBIT_API_BASE = (process.env.RQBIT_API_BASE || '').replace(/\/$/, '');
+const RQBIT_API_TOKEN = process.env.RQBIT_API_TOKEN || '';
 
 // Temp directory for storing incoming .torrent files before moving
 const TMP_DIR = process.env.TMP_DIR || path.join(process.cwd(), 'tmp');
@@ -119,16 +120,6 @@ async function addTorrentViaRtxmlrpc(filePath) {
   throw new Error('Failed to add torrent via rtxmlrpc. Ensure rtxmlrpc is installed and rTorrent exposes SCGI.');
 }
 
-async function addMagnetViaRtxmlrpc(magnetLink) {
-  if (!magnetLink || !magnetLink.toLowerCase().startsWith('magnet:?')) {
-    throw new Error('Неверная ссылка magnet.');
-  }
-  const scgi = RTORRENT_SCGI;
-  // load.start with empty tied directory and the magnet URI
-  await execRtxmlrpc(['-p', scgi, 'load.start', '', magnetLink]);
-  return true;
-}
-
 async function handleDownloadCommand(msg) {
   const chatId = msg.chat.id;
   awaitingTorrent.set(chatId, true);
@@ -150,20 +141,13 @@ async function handleIncomingDocument(msg) {
     const file = await bot.getFile(doc.file_id);
     const tempName = `${doc.file_unique_id || doc.file_id}.torrent`;
     const tempPath = path.join(TMP_DIR, tempName);
+		console.log('tempPath',tempPath, tempName );
     await downloadFileFromTelegram(file.file_path, tempPath);
 
-    let methodUsed = '';
-    if (WATCH_DIR) {
-      const target = await saveTorrentToWatchDir(tempPath, doc.file_name || tempName);
-      methodUsed = `Файл помещён в watch директорию: ${target}`;
-    } else {
-      // Try via rtxmlrpc
-      await addTorrentViaRtxmlrpc(tempPath);
-      methodUsed = 'Добавлено в rTorrent через rtxmlrpc.';
-    }
+    await addTorrentViaRqbit(tempPath, tempName);
 
     awaitingTorrent.delete(chatId);
-    await bot.sendMessage(chatId, `Торрент принят и добавлен. ${methodUsed}`);
+    await bot.sendMessage(chatId, 'Торрент принят и добавлен в rqbit.');
   } catch (err) {
     console.error(err);
     await bot.sendMessage(chatId, `Не удалось добавить торрент: ${err.message}`);
@@ -187,70 +171,61 @@ async function handleIncomingText(msg) {
     return;
   }
   try {
-    await addMagnetViaRtxmlrpc(text);
+    await addMagnetViaRqbit(text);
     awaitingMagnet.delete(chatId);
-    await bot.sendMessage(chatId, 'Magnet ссылка добавлена в rTorrent.');
+    await bot.sendMessage(chatId, 'Magnet ссылка добавлена в rqbit.');
   } catch (err) {
-    await bot.sendMessage(chatId, `Не удалось добавить magnet: ${err.message}\nУбедитесь, что доступен rtxmlrpc и настроен SCGI (RTORRENT_SCGI).`);
+    await bot.sendMessage(chatId, `Не удалось добавить magnet: ${err.message}`);
   }
-}
-
-async function getStatusViaRtxmlrpc() {
-  // Use d.multicall2 to fetch fields for all items in main view
-  const fields = [
-    'd.get_hash=',
-    'd.get_name=',
-    'd.get_state=', // 0 stopped, 1 started
-    'd.get_complete=', // 1 complete, 0 incomplete
-    'd.get_completed_bytes=',
-    'd.get_size_bytes=',
-    'd.get_down_rate=',
-    'd.get_up_rate=',
-  ];
-  const args = ['-p', RTORRENT_SCGI, 'd.multicall2', '', 'main', ...fields];
-  const out = await execRtxmlrpc(args, { timeoutMs: 5000 });
-
-  // rtxmlrpc output format can vary. Try to parse lines like:
-  // ( "hash" "name" 1 0 123 456 0 0 ) repeated per torrent
-  // We will extract quoted strings and numbers per line.
-  const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const items = [];
-  for (const line of lines) {
-    // Collect tokens: quoted strings or integers
-    const tokens = [];
-    const re = /"([^"]*)"|(-?\d+)/g;
-    let m;
-    while ((m = re.exec(line))) {
-      if (m[1] !== undefined) tokens.push(m[1]); else tokens.push(Number(m[2]));
-    }
-    if (tokens.length >= fields.length) {
-      const [hash, name, state, complete, doneBytes, sizeBytes, downRate, upRate] = tokens;
-      items.push({ hash, name, state, complete, doneBytes, sizeBytes, downRate, upRate });
-    }
-  }
-  return items;
 }
 
 async function handleStatusCommand(msg) {
   const chatId = msg.chat.id;
   try {
-    const items = await getStatusViaRtxmlrpc();
+    const items = await getStatusViaRqbit();
     if (!items.length) {
       await bot.sendMessage(chatId, 'Нет активных торрентов.');
       return;
     }
-    const lines = items.slice(0, 15).map((t) => {
-      const pct = t.sizeBytes > 0 ? Math.floor((t.doneBytes / t.sizeBytes) * 100) : 0;
-      const st = t.complete ? '✅' : (t.state ? '⬇️' : '⏸️');
-      const dr = t.downRate ? `${Math.round(t.downRate / 1024)} KB/s` : '0 KB/s';
-      return `${st} ${t.name}\n— ${pct}% • ${dr}`;
+		/*
+			*
+			* {
+    id: 0,
+    info_hash: 'ecfb270544a6935f959e75a7dd4303664c08b950',
+    name: 'Adobe Photoshop 2023 24.7.4.1251 RePack by KpoJIuK.exe',
+    output_folder: '../1/',
+    infoData: {
+      state: 'paused',
+      file_progress: [Array],
+      error: null,
+      progress_bytes: 571154421,
+      uploaded_bytes: 0,
+      total_bytes: 3279626229,
+      finished: false,
+      live: null
+    }
+  }
+			*
+			* */
+    const lines = items.map((t) => {
+
+      //const pct = t.sizeBytes > 0 ? Math.floor((t.doneBytes / t.sizeBytes) * 100) : 0;
+      //const st = t.complete ? '✅' : (t.state ? '⬇️' : '⏸️');
+      //const dr = t.downRate ? `${Math.round(t.downRate / 1024)} KB/s` : '0 KB/s';
+			let status = '✅';
+			if(t.infoData.state === 'paused') {
+				status = '⏸️';
+			}
+			if(t.infoData.state === 'live') {
+				status = '⬇️';
+			}
+      const pct = t.infoData.total_bytes > 0 ? Math.floor((t.infoData.progress_bytes / t.infoData.total_bytes) * 100) : 0;
+
+			return `${t.id}: ${t.name} ${status} ${pct}`;
     });
     await bot.sendMessage(chatId, lines.join('\n\n'));
   } catch (err) {
-    const hint = WATCH_DIR
-      ? 'Статус требует rtxmlrpc и SCGI (RTORRENT_SCGI) для опроса.'
-      : 'Проверьте установку rtxmlrpc и SCGI (RTORRENT_SCGI).';
-    await bot.sendMessage(chatId, `Не удалось получить статус: ${err.message}\n${hint}`);
+    await bot.sendMessage(chatId, `Не удалось получить статус: ${err.message}`);
   }
 }
 
@@ -263,7 +238,7 @@ bot.setMyCommands([
 
 bot.onText(/^\/start/, async (msg) => {
   const text = [
-    'Привет! Я бот для загрузки торрентов через rTorrent.',
+    'Привет! Я бот для загрузки торрентов через rqbit.',
     'Команды:',
     '/download — пришлите .torrent файл для добавления',
     '/status — показать статус текущих загрузок',
@@ -287,3 +262,97 @@ bot.on('message', async (msg) => {
 });
 
 console.log('Bot started. Waiting for messages...');
+// rqbit functions added at end to ensure availability
+// (Definitions)
+
+function rqbitHeaders(extra) {
+  const headers = Object.assign({ Accept: 'application/json' }, extra || {});
+  if (RQBIT_API_TOKEN) headers['Authorization'] = `Bearer ${RQBIT_API_TOKEN}`;
+  return headers;
+}
+
+async function rqbitFetch(pathname, init = {}) {
+  if (!RQBIT_API_BASE) throw new Error('RQBIT_API_BASE is not configured');
+  const url = `${RQBIT_API_BASE}${pathname.startsWith('/') ? '' : '/'}${pathname}`;
+  const res = await fetch(url, { ...init, headers: rqbitHeaders(init.headers || {}) });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`rqbit API error ${res.status}: ${text || res.statusText}`);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
+}
+
+async function addTorrentViaRqbit(filePath) {
+	let res;
+  const url = `${RQBIT_API_BASE}/torrents?&overwrite=true&only_files=0&initial_peers=&output_folder=${TORRENT_DOWNLOAD_FOLDER}`;
+  const buf = await fsp.readFile(filePath);
+		 res = await fetch(url, {
+			method: "POST",
+			// для .torrent корректный тип:
+			headers: { "Content-Type": "application/x-bittorrent" },
+			body: buf
+		});
+		if(res.status !== 200) {
+			throw 'Ошибка обработки торент файла';
+		}
+
+	return res;
+}
+
+async function addMagnetViaRqbit(magnetLink) {
+  if (!magnetLink || !magnetLink.toLowerCase().startsWith('magnet:?')) {
+    throw new Error('Неверная ссылка magnet.');
+  }
+  const url = `${RQBIT_API_BASE}/torrents?&overwrite=true&only_files=0&initial_peers=&output_folder=${TORRENT_DOWNLOAD_FOLDER}`;
+	 const res = await fetch(url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: magnetLink
+	});
+	if(res.status !== 200) {
+		throw new Error('Не удалось добавить magnet в rqbit API');
+	}
+}
+
+const getTorrentList = async () => {
+  const url = '/torrents';
+  let lastErr;
+	let data = [];
+    try {
+      data = (await rqbitFetch(url, { method: 'GET' })).torrents
+    } catch (e) {
+      lastErr = e;
+  throw lastErr || new Error('rqbit API ошибка получения списка торенов');
+  }
+  return data;
+}
+
+const getTorrentStatusById = async (torrentId) => {
+  const url = `torrents/${torrentId}/stats/v1`;
+  let lastErr;
+	let data = [];
+    try {
+      data = await rqbitFetch(url, { method: 'GET' });
+    } catch (e) {
+      lastErr = e;
+  throw lastErr || new Error('rqbit API ошибка получения списка торенов');
+  }
+  return data;
+}
+
+async function getStatusViaRqbit() {
+  let lastErr;
+	let torrentList = [];
+    try {
+			torrentList = await getTorrentList();
+			for(let torrent of torrentList) {
+				torrent.infoData = await getTorrentStatusById(torrent.id);
+			}
+    } catch (e) {
+      lastErr = e;
+			throw lastErr || new Error('rqbit API недоступен для получения статуса');
+  }
+  return torrentList;
+}
